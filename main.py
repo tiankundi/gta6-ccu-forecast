@@ -13,10 +13,17 @@ Method (calibrated on the case's own comparables at run time, stdlib only):
     single-player).  Multi-platform launches with a simultaneous PC unlock
     spike hour 1 and decay, a different shape, so they are left out.
   * Centre of each hour: the trimmed mean (drop the outer 20% each side) of
-    log(viewers_h / viewers_1) over the console-only comparables.  In a
-    leave-one-out backtest on the 8 console-only launches in the practice
-    kits this shape cut the pinball loss from 0.323 (house persistence
-    baseline) to about 0.20.
+    log(viewers_h / viewers_1) over the console-only comparables, then a
+    scale adjustment: centre_h += slope_h * (log p1 - mean log p1 of the
+    group), where slope_h is the per-hour OLS slope of the log ratios on
+    log hour-1 viewers, fit on the group itself.  The day's growth depends
+    on launch size (peak log ratio correlates about -0.85 with log hour-1
+    viewers across the console launches), so a big midnight print flattens
+    the shape and a small one steepens it.  In a leave-one-out backtest on
+    the 8 console-only launches in the practice kits this cut the pinball
+    loss from 0.323 (house persistence baseline) to 0.170, from 0.205 for
+    the unadjusted shape; the two worst launches improved from 0.367/0.318
+    to 0.159/0.170.
   * Spread: q_tau(h) = p1 * exp(centre_h + z_tau * s_h) with
     s_h = 0.15 + 0.07 * sqrt(h - 1) (z the standard normal quantiles
     -1.645, -0.674, 0, 0.674, 1.645).  The schedule was picked on the same
@@ -127,8 +134,40 @@ def shape_centres(curves):
     return centres
 
 
+def shape_slopes(curves):
+    """Per-hour OLS slope of log ratio to hour 1 on log hour-1 viewers.
+
+    Across the console-only launches the day's growth depends on launch
+    size: the log ratio at the peak correlates about -0.85 with log hour-1
+    viewers (a huge midnight print means the day is already near its peak;
+    a small one leaves room to grow through the day).  The slope is fit on
+    the same group as the centres, per hour, with no tuned constant; with
+    fewer than three ratios at an hour the slope is 0 (no adjustment).
+    """
+    slopes = {}
+    for h in range(2, 25):
+        pairs = [
+            (math.log(curve[1]), math.log(curve[h] / curve[1]))
+            for curve in curves
+            if h in curve and curve[h] > 0
+        ]
+        if len(pairs) < 3:
+            slopes[h] = 0.0
+            continue
+        mean_x = sum(p[0] for p in pairs) / len(pairs)
+        mean_y = sum(p[1] for p in pairs) / len(pairs)
+        denom = sum((x - mean_x) ** 2 for x, _ in pairs)
+        if denom == 0:
+            slopes[h] = 0.0
+        else:
+            slopes[h] = (
+                sum((x - mean_x) * (y - mean_y) for x, y in pairs) / denom
+            )
+    return slopes
+
+
 def forecast_shape(case):
-    """Return {hour: centre log-ratio} or None when the case gives no usable shape."""
+    """Return (centres, slopes, mean log hour-1) or None when no usable shape."""
     own_name = (case.get("game") or {}).get("name", "")
     comparables = case.get("comparables") or []
     console_curves = []
@@ -150,7 +189,10 @@ def forecast_shape(case):
         if len(group) >= MIN_CLASS:
             centres = shape_centres(group)
             if len(centres) >= 20:
-                return centres
+                mean_log_p1 = sum(
+                    math.log(curve[1]) for curve in group
+                ) / len(group)
+                return centres, shape_slopes(group), mean_log_p1
     return None
 
 
@@ -185,12 +227,17 @@ def forecast_case(case, name):
     else:
         history = case.get("history") or []
         p1 = max(1.0, float(history[-1]["viewers"])) if history else 1.0
-    centres = forecast_shape(case)
+    shape = forecast_shape(case)
     hours = []
     for row in case["forecast"]:
         h = row["hour"]
-        if centres is not None and h in centres:
-            q = hour_quantiles(p1, centres[h], h)
+        if shape is not None and h in shape[0]:
+            centres, slopes, mean_log_p1 = shape
+            # Scale adjustment: a case whose hour-1 print is above the
+            # group's typical size grows less through the day (and vice
+            # versa), per the per-hour slope fit on the group itself.
+            centre = centres[h] + slopes[h] * (math.log(p1) - mean_log_p1)
+            q = hour_quantiles(p1, centre, h)
         else:
             q = baseline_quantiles(p1, h)
         hours.append({"hour": h, "q": q})
